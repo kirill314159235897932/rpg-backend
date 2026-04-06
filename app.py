@@ -1,11 +1,23 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 import random
+import requests
+import threading
+import time
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
 app.secret_key = 'rpg-game-secret-key-2024'
 CORS(app)
+
+# ============ НАСТРОЙКИ DONATIONALERTS ============
+DA_CLIENT_ID = "18475"
+DA_CLIENT_SECRET = "C6qEYM6eRHeSGGIjEzXzOzWSZ3ZNWD6tsokDnEMg"
+DA_REDIRECT_URI = "https://rpg-backend-uch9.onrender.com/api/donate/callback"
+
+# Хранилище токенов (в реальном проекте - БД)
+user_tokens = {}  # session_id -> access_token
+donation_alerts_token = None  # глобальный токен приложения
 
 # ============ КЛАСС ПЕРСОНАЖА ============
 class RPGCharacter:
@@ -28,61 +40,30 @@ class RPGCharacter:
         self.blades_count = 6
         self.inventory = ["Зелье здоровья", "Простой меч"]
         self.location = "Стена Мария"
-        self.quests = {
-            "Обычные титаны": {"цель": 5, "прогресс": 0, "награда": 50}
-        }
-        self.titan_kills = {
-            "Обычный титан": 0,
-            "Аномальный титан": 0,
-            "Звероподобный титан": 0,
-            "Броня Титана": 0,
-            "Колоссальный титан": 0,
-            "Дракон": 0
-        }
+        self.quests = {}
+        self.titan_kills = {}
         self.last_rest = None
         self.last_training = None
         self.daily_reward = None
         self.mikasa_relationship = 0
-        self.mikasa_available = False
         self.mikasa_level = 0
         self.has_companion = False
-        self.companion_name = None
     
     def to_dict(self):
         return {
-            "user_id": self.user_id,
-            "name": self.name,
-            "level": self.level,
-            "exp": self.exp,
-            "max_exp": self.max_exp,
-            "health": self.health,
-            "max_health": self.max_health,
-            "energy": self.energy,
-            "max_energy": self.max_energy,
-            "attack": self.attack,
-            "defense": self.defense,
-            "agility": self.agility,
-            "gold": self.gold,
-            "odm_gear": self.odm_gear,
-            "gas_level": self.gas_level,
-            "blades_count": self.blades_count,
-            "inventory": self.inventory,
-            "location": self.location,
-            "quests": self.quests,
-            "titan_kills": self.titan_kills,
-            "last_rest": self.last_rest.isoformat() if self.last_rest else None,
-            "last_training": self.last_training.isoformat() if self.last_training else None,
-            "daily_reward": self.daily_reward.isoformat() if self.daily_reward else None,
-            "mikasa_relationship": self.mikasa_relationship,
-            "mikasa_available": self.mikasa_available,
-            "mikasa_level": self.mikasa_level,
-            "has_companion": self.has_companion,
-            "companion_name": self.companion_name
+            "user_id": self.user_id, "name": self.name, "level": self.level,
+            "exp": self.exp, "max_exp": self.max_exp, "health": self.health,
+            "max_health": self.max_health, "energy": self.energy, "max_energy": self.max_energy,
+            "attack": self.attack, "defense": self.defense, "agility": self.agility,
+            "gold": self.gold, "odm_gear": self.odm_gear, "gas_level": self.gas_level,
+            "blades_count": self.blades_count, "inventory": self.inventory, "location": self.location,
+            "quests": self.quests, "titan_kills": self.titan_kills,
+            "mikasa_relationship": self.mikasa_relationship, "mikasa_level": self.mikasa_level,
+            "has_companion": self.has_companion
         }
     
     def can_rest(self):
-        if not self.last_rest:
-            return True
+        if not self.last_rest: return True
         return datetime.now() - self.last_rest > timedelta(minutes=5)
     
     def rest(self):
@@ -95,13 +76,11 @@ class RPGCharacter:
         return True
     
     def can_train(self):
-        if not self.last_training:
-            return True
+        if not self.last_training: return True
         return datetime.now() - self.last_training > timedelta(seconds=10)
     
     def can_get_daily(self):
-        if not self.daily_reward:
-            return True
+        if not self.daily_reward: return True
         return datetime.now() - self.daily_reward > timedelta(hours=24)
 
 # Данные титанов
@@ -116,11 +95,11 @@ TITANS = {
 
 # Локации
 LOCATIONS = {
-    "Стена Мария": {"description": "🏛️ СТЕНА МАРИЯ\nСамый внешний округ"},
-    "Стена Роза": {"description": "🏛️ СТЕНА РОЗА\nВторой округ"},
-    "Стена Сина": {"description": "🏛️ СТЕНА СИНА\nВнутренний округ"},
-    "За стеной": {"description": "🌲 ТИТАНИЧЕСКИЙ ЛЕС\nОпасная территория"},
-    "Казармы": {"description": "⚔️ КАЗАРМЫ\nЗдесь можно получить задания"},
+    "Стена Мария": {"description": "🏛️ СТЕНА МАРИЯ"},
+    "Стена Роза": {"description": "🏛️ СТЕНА РОЗА"},
+    "Стена Сина": {"description": "🏛️ СТЕНА СИНА"},
+    "За стеной": {"description": "🌲 ТИТАНИЧЕСКИЙ ЛЕС"},
+    "Казармы": {"description": "⚔️ КАЗАРМЫ"},
     "Тренировочная площадка": {"description": "🎯 ТРЕНИРОВОЧНАЯ ПЛОЩАДКА"},
     "Торговый район": {"description": "🛒 ТОРГОВЫЙ РАЙОН"},
     "Магазин оружия": {"description": "⚔️ МАГАЗИН ОРУЖИЯ"},
@@ -128,7 +107,7 @@ LOCATIONS = {
     "Магазин ODM": {"description": "⚡ МАГАЗИН ODM"},
     "Черный рынок": {"description": "🛒 ЧЕРНЫЙ РЫНОК"},
     "Центральная площадь": {"description": "🏙️ ЦЕНТРАЛЬНАЯ ПЛОЩАДЬ"},
-    "Таверна": {"description": "🍺 ТАВЕРНА\nИгры и сплетни"},
+    "Таверна": {"description": "🍺 ТАВЕРНА"},
     "Госпиталь": {"description": "🏥 ГОСПИТАЛЬ"},
     "Лаборатория": {"description": "🔬 ЛАБОРАТОРИЯ"},
     "Королевский дворец": {"description": "👑 КОРОЛЕВСКИЙ ДВОРЕЦ"},
@@ -141,7 +120,233 @@ LOCATIONS = {
 players = {}
 battles = {}
 
-# ============ API ЭНДПОИНТЫ ============
+# ============ ДОНАТ-СИСТЕМА ============
+
+player_diamonds = {}
+player_privileges = {}
+
+PRIVILEGES_SHOP = {
+    "green_nick": {"name": "💚 Зеленый ник в чате", "price": 50, "duration": 30, "badge": "💚", "color": "#88ff88"},
+    "silver_nick": {"name": "⭐ Серебряный ник + бейдж", "price": 150, "duration": 30, "badge": "⭐", "color": "#c0c0c0"},
+    "gold_nick": {"name": "👑 Золотой ник + бейдж", "price": 300, "duration": 30, "badge": "👑", "color": "#ffd700"},
+    "rainbow_nick": {"name": "🌈 Радужный ник", "price": 500, "duration": 30, "badge": "🌈", "color": "rainbow"}
+}
+
+DIAMOND_RATES = {100: 100, 300: 330, 500: 600, 1000: 1300}
+pending_donations = {}
+
+# ============ API ДОНАТА ============
+
+@app.route('/api/donate/auth', methods=['GET'])
+def donate_auth():
+    """Начало OAuth авторизации DonationAlerts"""
+    auth_url = f"https://www.donationalerts.com/oauth/authorize?client_id={DA_CLIENT_ID}&redirect_uri={DA_REDIRECT_URI}&response_type=code&scope=oauth-donation-subscribe+oauth-user-show"
+    return redirect(auth_url)
+
+@app.route('/api/donate/callback', methods=['GET'])
+def donate_callback():
+    """Callback после авторизации"""
+    code = request.args.get('code')
+    if not code:
+        return jsonify({"error": "No code provided"})
+    
+    # Обмен кода на токен
+    token_url = "https://www.donationalerts.com/oauth/token"
+    data = {
+        "client_id": DA_CLIENT_ID,
+        "client_secret": DA_CLIENT_SECRET,
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": DA_REDIRECT_URI
+    }
+    
+    response = requests.post(token_url, data=data)
+    if response.status_code == 200:
+        token_data = response.json()
+        access_token = token_data.get('access_token')
+        global donation_alerts_token
+        donation_alerts_token = access_token
+        print(f"✅ Получен токен DonationAlerts: {access_token[:20]}...")
+        
+        # Запускаем слушатель донатов
+        start_donation_listener()
+        
+        return jsonify({"success": True, "message": "DonationAlerts подключен!"})
+    else:
+        return jsonify({"error": "Failed to get token"})
+
+@app.route('/api/donate/create', methods=['POST'])
+def create_donation():
+    data = request.json
+    session_id = data.get('session_id')
+    amount = data.get('amount')
+    
+    if not session_id or session_id not in players:
+        return jsonify({"error": "Сначала создайте персонажа"})
+    
+    player = players[session_id]
+    diamonds = DIAMOND_RATES.get(amount, amount)
+    donation_id = str(random.randint(10000, 99999)) + str(int(datetime.now().timestamp()))
+    
+    pending_donations[donation_id] = {
+        "session_id": session_id,
+        "player_name": player.name,
+        "amount": amount,
+        "diamonds": diamonds,
+        "created": datetime.now()
+    }
+    
+    donation_url = f"https://www.donationalerts.com/r/dfg45?amount={amount}&custom={donation_id}"
+    
+    return jsonify({
+        "success": True,
+        "donation_url": donation_url,
+        "amount": amount,
+        "diamonds": diamonds,
+        "donation_id": donation_id
+    })
+
+def start_donation_listener():
+    """Запуск слушателя донатов через WebSocket"""
+    if not donation_alerts_token:
+        print("⚠️ Нет токена DonationAlerts")
+        return
+    
+    def listen():
+        import websocket
+        import json
+        
+        def on_message(ws, message):
+            try:
+                data = json.loads(message)
+                if data.get('type') == 'donation':
+                    don_data = data.get('data', {})
+                    custom = don_data.get('custom', '')
+                    amount = don_data.get('amount', 0)
+                    username = don_data.get('username', '')
+                    
+                    if custom in pending_donations:
+                        donation = pending_donations[custom]
+                        session_id = donation["session_id"]
+                        diamonds = donation["diamonds"]
+                        player_diamonds[session_id] = player_diamonds.get(session_id, 0) + diamonds
+                        del pending_donations[custom]
+                        print(f"💎 Донат от {username}: {amount}₽ → +{diamonds} алмазов!")
+            except Exception as e:
+                print(f"Ошибка: {e}")
+        
+        def on_open(ws):
+            # Авторизация на WebSocket
+            auth_msg = json.dumps({
+                "type": "oauth",
+                "token": donation_alerts_token
+            })
+            ws.send(auth_msg)
+            print("🔗 WebSocket DonationAlerts подключен")
+        
+        websocket_url = "wss://centrifugo.donationalerts.com/connection/websocket"
+        ws = websocket.WebSocketApp(websocket_url, on_open=on_open, on_message=on_message)
+        
+        while True:
+            try:
+                ws.run_forever()
+            except Exception as e:
+                print(f"WebSocket ошибка: {e}")
+            time.sleep(5)
+    
+    thread = threading.Thread(target=listen, daemon=True)
+    thread.start()
+
+@app.route('/api/donate/test/<donation_id>', methods=['GET'])
+def test_donation(donation_id):
+    """Тестовый эндпоинт для имитации оплаты (без реальных денег)"""
+    if donation_id not in pending_donations:
+        return jsonify({"error": "Донат не найден"})
+    
+    donation = pending_donations[donation_id]
+    session_id = donation["session_id"]
+    diamonds = donation["diamonds"]
+    player_diamonds[session_id] = player_diamonds.get(session_id, 0) + diamonds
+    del pending_donations[donation_id]
+    
+    return jsonify({
+        "success": True,
+        "message": f"✨ Тестовый донат! Начислено {diamonds} алмазов!",
+        "diamonds": diamonds
+    })
+
+@app.route('/api/diamonds/get', methods=['POST'])
+def get_diamonds():
+    data = request.json
+    session_id = data.get('session_id')
+    if not session_id:
+        return jsonify({"error": "Сессия не найдена"})
+    diamonds = player_diamonds.get(session_id, 0)
+    return jsonify({"diamonds": diamonds})
+
+@app.route('/api/privileges/list', methods=['GET'])
+def list_privileges():
+    return jsonify({"privileges": PRIVILEGES_SHOP})
+
+@app.route('/api/privileges/buy', methods=['POST'])
+def buy_privilege():
+    data = request.json
+    session_id = data.get('session_id')
+    privilege_type = data.get('privilege_type')
+    
+    if not session_id:
+        return jsonify({"error": "Сессия не найдена"})
+    if privilege_type not in PRIVILEGES_SHOP:
+        return jsonify({"error": "Привилегия не найдена"})
+    
+    privilege = PRIVILEGES_SHOP[privilege_type]
+    current_diamonds = player_diamonds.get(session_id, 0)
+    
+    if current_diamonds < privilege["price"]:
+        return jsonify({"error": f"Недостаточно алмазов! Нужно {privilege['price']}"})
+    
+    player_diamonds[session_id] = current_diamonds - privilege["price"]
+    expires = datetime.now() + timedelta(days=privilege["duration"])
+    player_privileges[session_id] = {
+        "type": privilege_type,
+        "expires": expires,
+        "badge": privilege["badge"],
+        "color": privilege["color"],
+        "name": privilege["name"]
+    }
+    
+    return jsonify({
+        "success": True,
+        "message": f"🎉 Привилегия '{privilege['name']}' активирована!",
+        "diamonds": player_diamonds[session_id],
+        "privilege": player_privileges[session_id]
+    })
+
+@app.route('/api/privileges/status', methods=['POST'])
+def get_privilege_status():
+    data = request.json
+    session_id = data.get('session_id')
+    player_name = data.get('player_name')
+    
+    privilege = None
+    for sid, priv in player_privileges.items():
+        if sid == session_id:
+            if priv["expires"] > datetime.now():
+                privilege = priv
+            else:
+                del player_privileges[sid]
+            break
+    
+    if not privilege and player_name:
+        for sid, priv in player_privileges.items():
+            if sid in players and players[sid].name == player_name:
+                if priv["expires"] > datetime.now():
+                    privilege = priv
+                break
+    
+    return jsonify({"privilege": privilege})
+
+# ============ ОСНОВНЫЕ API ============
 
 @app.route('/api/create', methods=['POST'])
 def create_character():
@@ -163,7 +368,7 @@ def game_action():
     
     player = players[session_id]
     
-    # ============ НАВИГАЦИЯ ПО ЛОКАЦИЯМ ============
+    # Навигация
     if action in LOCATIONS:
         player.location = action
         return jsonify({"success": True, "location": action, "description": LOCATIONS[action]["description"], "player": player.to_dict()})
@@ -183,86 +388,48 @@ def game_action():
             player.location = "Стена Мария"
         return jsonify({"success": True, "location": player.location, "description": LOCATIONS[player.location]["description"], "player": player.to_dict()})
     
-    # ============ ХАРАКТЕРИСТИКИ ============
+    # Характеристики
     if action == "stats":
         return jsonify({"stats": player.to_dict()})
     
     if action == "inventory":
         return jsonify({"inventory": player.inventory, "player": player.to_dict()})
     
-    # ============ ОТДЫХ И ЛЕЧЕНИЕ ============
-    if action == "rest":
-        if player.can_rest():
-            player.rest()
-            return jsonify({"success": True, "message": "Вы отдохнули!", "player": player.to_dict()})
-        return jsonify({"error": "Отдых доступен раз в 5 минут!"})
+    # Отдых и лечение
+    if action == "rest" and player.can_rest():
+        player.rest()
+        return jsonify({"success": True, "message": "Вы отдохнули!", "player": player.to_dict()})
     
-    if action == "heal":
-        if player.gold >= 10:
-            player.gold -= 10
-            player.health = player.max_health
-            return jsonify({"success": True, "message": "Вылечены!", "player": player.to_dict()})
-        return jsonify({"error": f"Недостаточно золота! Нужно 10"})
+    if action == "heal" and player.gold >= 10:
+        player.gold -= 10
+        player.health = player.max_health
+        return jsonify({"success": True, "message": "Вылечены!", "player": player.to_dict()})
     
-    if action == "daily":
-        if player.can_get_daily():
-            player.daily_reward = datetime.now()
-            reward = random.randint(50, 150)
-            player.gold += reward
-            return jsonify({"success": True, "message": f"Ежедневная награда! +{reward} золота", "player": player.to_dict()})
-        return jsonify({"error": "Награда доступна раз в 24 часа!"})
+    if action == "daily" and player.can_get_daily():
+        player.daily_reward = datetime.now()
+        reward = random.randint(50, 150)
+        player.gold += reward
+        return jsonify({"success": True, "message": f"Ежедневная награда! +{reward} золота", "player": player.to_dict()})
     
-    # ============ ТРЕНИРОВКИ ============
-    if action == "train_odm":
-        if not player.odm_gear:
-            return jsonify({"error": "Нет ODM снаряжения!"})
-        if player.gas_level < 20 or player.blades_count < 2:
-            return jsonify({"error": "Недостаточно газа или лезвий!"})
-        if not player.can_train():
-            return jsonify({"error": "Подождите 10 секунд!"})
-        
+    # Тренировки
+    if action == "train_odm" and player.odm_gear and player.gas_level >= 20 and player.blades_count >= 2 and player.can_train():
         player.gas_level -= 20
         player.blades_count -= 2
         exp_gain = random.randint(25, 40)
-        agility_gain = random.randint(1, 3)
         player.exp += exp_gain
-        player.agility += agility_gain
         player.last_training = datetime.now()
-        
-        level_msg = ""
-        if player.exp >= player.max_exp:
-            player.level += 1
-            player.exp -= player.max_exp
-            player.max_exp = int(player.max_exp * 1.5)
-            level_msg = f"\n⭐ НОВЫЙ УРОВЕНЬ {player.level}!"
-        
-        return jsonify({"success": True, "message": f"Тренировка! +{exp_gain} опыта, ловкость +{agility_gain}{level_msg}", "player": player.to_dict()})
+        return jsonify({"success": True, "message": f"Тренировка! +{exp_gain} опыта", "player": player.to_dict()})
     
-    if action == "train_normal":
-        if not player.can_train():
-            return jsonify({"error": "Подождите 10 секунд!"})
-        
+    if action == "train_normal" and player.can_train():
         exp_gain = random.randint(10, 20)
-        attack_gain = random.randint(1, 2)
         player.exp += exp_gain
-        player.attack += attack_gain
         player.last_training = datetime.now()
-        
-        level_msg = ""
-        if player.exp >= player.max_exp:
-            player.level += 1
-            player.exp -= player.max_exp
-            player.max_exp = int(player.max_exp * 1.5)
-            level_msg = f"\n⭐ НОВЫЙ УРОВЕНЬ {player.level}!"
-        
-        return jsonify({"success": True, "message": f"Тренировка! +{exp_gain} опыта, атака +{attack_gain}{level_msg}", "player": player.to_dict()})
+        return jsonify({"success": True, "message": f"Тренировка! +{exp_gain} опыта", "player": player.to_dict()})
     
-    # ============ ПОКУПКИ ============
+    # Покупки
     if action == "buy_odm" and player.gold >= 100:
         player.gold -= 100
         player.odm_gear = True
-        player.gas_level = 100
-        player.blades_count = 6
         return jsonify({"success": True, "message": "Куплено ODM!", "player": player.to_dict()})
     
     if action == "buy_gas" and player.gold >= 20:
@@ -278,569 +445,66 @@ def game_action():
     if action == "buy_sword" and player.gold >= 50:
         player.gold -= 50
         player.attack += 5
-        player.inventory.append("Меч")
         return jsonify({"success": True, "message": "Куплен меч! Атака +5", "player": player.to_dict()})
-    
-    if action == "buy_shield" and player.gold >= 30:
-        player.gold -= 30
-        player.defense += 3
-        player.inventory.append("Щит")
-        return jsonify({"success": True, "message": "Куплен щит! Защита +3", "player": player.to_dict()})
-    
-    if action == "buy_bow" and player.gold >= 70:
-        player.gold -= 70
-        player.attack += 7
-        player.inventory.append("Лук")
-        return jsonify({"success": True, "message": "🏹 Куплен лук! Атака +7", "player": player.to_dict()})
-    
-    if action == "buy_crossbow" and player.gold >= 100:
-        player.gold -= 100
-        player.attack += 10
-        player.inventory.append("Арбалет")
-        return jsonify({"success": True, "message": "🎯 Куплен арбалет! Атака +10", "player": player.to_dict()})
     
     if action == "buy_potion" and player.gold >= 20:
         player.gold -= 20
         player.inventory.append("Зелье здоровья")
         return jsonify({"success": True, "message": "Куплено зелье!", "player": player.to_dict()})
     
-    if action == "buy_big_potion" and player.gold >= 40:
-        player.gold -= 40
-        player.inventory.append("Большое зелье")
-        return jsonify({"success": True, "message": "⚗️ Куплено большое зелье!", "player": player.to_dict()})
-    
-    if action == "buy_herbs" and player.gold >= 10:
-        player.gold -= 10
-        player.inventory.append("Лечебные травы")
-        return jsonify({"success": True, "message": "🌿 Куплены лечебные травы!", "player": player.to_dict()})
-    
-    if action == "buy_antidote" and player.gold >= 25:
-        player.gold -= 25
-        player.inventory.append("Антидот")
-        return jsonify({"success": True, "message": "💊 Куплен антидот!", "player": player.to_dict()})
-    
-    if action == "buy_battery" and player.gold >= 50:
-        player.gold -= 50
-        player.energy = min(player.max_energy, player.energy + 50)
-        player.inventory.append("Батарея ODM")
-        return jsonify({"success": True, "message": "⚡ Куплена батарея ODM! Энергия +50", "player": player.to_dict()})
-    
-    if action == "buy_repair_kit" and player.gold >= 30:
-        player.gold -= 30
-        player.gas_level = 100
-        player.blades_count = 6
-        return jsonify({"success": True, "message": "🔧 ODM отремонтирован!", "player": player.to_dict()})
-    
-    # ============ ЧЕРНЫЙ РЫНОК ============
-    if action == "buy_artifact" and player.gold >= 200:
-        player.gold -= 200
-        player.inventory.append("Редкий артефакт")
-        return jsonify({"success": True, "message": "🎖️ Куплен редкий артефакт!", "player": player.to_dict()})
-    
-    if action == "buy_gem" and player.gold >= 150:
-        player.gold -= 150
-        player.inventory.append("Драгоценный камень")
-        return jsonify({"success": True, "message": "💎 Куплен драгоценный камень!", "player": player.to_dict()})
-    
-    if action == "buy_treasure_map" and player.gold >= 100:
-        player.gold -= 100
-        player.inventory.append("Карта сокровищ")
-        return jsonify({"success": True, "message": "📜 Куплена карта сокровищ!", "player": player.to_dict()})
-    
-    if action == "buy_magic_crystal" and player.gold >= 300:
-        player.gold -= 300
-        player.attack += 3
-        player.defense += 3
-        player.agility += 3
-        player.max_health += 20
-        player.health = player.max_health
-        player.inventory.append("Магический кристалл")
-        return jsonify({"success": True, "message": "🔮 Магический кристалл активирован! Все характеристики +3, здоровье +20", "player": player.to_dict()})
-    
-    # ============ ТАВЕРНА ============
-    if action == "play_dice":
-        if player.gold >= 10:
-            player.gold -= 10
-            player_dice = random.randint(1, 6)
-            tavern_dice = random.randint(1, 6)
-            
-            if player_dice > tavern_dice:
-                win = random.randint(15, 25)
-                player.gold += win
-                message = f"🎲 ВЫ ВЫИГРАЛИ! Ваша кость: {player_dice}, кость таверны: {tavern_dice}. Выигрыш: {win} золота!"
-            elif player_dice < tavern_dice:
-                message = f"🎲 ВЫ ПРОИГРАЛИ! Ваша кость: {player_dice}, кость таверны: {tavern_dice}. Потеряно: 10 золота."
-            else:
-                player.gold += 5
-                message = f"🎲 НИЧЬЯ! Ваша кость: {player_dice}, кость таверны: {tavern_dice}. Возвращено 5 золота."
-            
-            return jsonify({"success": True, "message": message, "player": player.to_dict()})
-        return jsonify({"error": "Недостаточно золота для игры в кости!"})
-    
-    if action == "gossip":
-        rumors = [
-            "Говорят, что в лесу видели странного титана, который ходит на двух ногах.",
-            "В таверне шепчутся, что кто-то нашел древний артефакт за стеной.",
-            "Ходят слухи, что Королевский дворец готовит большую экспедицию.",
-            "Старый охотник рассказывает о тайных туннелях под стеной.",
-            "Говорят, в лаборатории Ханджи проводят опасные эксперименты."
-        ]
-        rumor = random.choice(rumors)
-        return jsonify({"success": True, "message": f"🗣️ {rumor}", "player": player.to_dict()})
-    
-    if action == "drink_beer":
-        if player.gold >= 5:
-            player.gold -= 5
-            player.energy = min(player.max_energy, player.energy + 10)
-            return jsonify({"success": True, "message": "🍺 Вы выпили кружку эля! Энергия +10", "player": player.to_dict()})
-        return jsonify({"error": "Недостаточно золота! Нужно 5"})
-    
-    # ============ ЦЕНТРАЛЬНАЯ ПЛОЩАДЬ ============
-    if action == "talk_citizens":
-        dialogues = [
-            "Горожанин: 'Титаны становятся все опаснее...'",
-            "Горожанин: 'Разведкорпус готовит новую экспедицию.'",
-            "Горожанин: 'Береги себя за стеной!'",
-            "Горожанин: 'Слышал, кто-то нашел древнее оружие.'"
-        ]
-        return jsonify({"success": True, "message": f"🗣️ {random.choice(dialogues)}", "player": player.to_dict()})
-    
-    # ============ ЛАБОРАТОРИЯ ============
-    if action == "submit_trophies":
-        trophy_items = ["Фрагмент брони Титана", "Часть пара Колосса", "Чешуя дракона", "Редкий артефакт", "Драгоценный камень"]
-        total_value = 0
-        trophies_found = []
-        
-        for item in trophy_items:
-            count = player.inventory.count(item)
-            if count > 0:
-                trophies_found.append(f"{item} x{count}")
-                for _ in range(count):
-                    player.inventory.remove(item)
-                if item == "Фрагмент брони Титана":
-                    total_value += 100 * count
-                elif item == "Часть пара Колосса":
-                    total_value += 150 * count
-                elif item == "Чешуя дракона":
-                    total_value += 200 * count
-                elif item == "Редкий артефакт":
-                    total_value += 50 * count
-                elif item == "Драгоценный камень":
-                    total_value += 30 * count
-        
-        if trophies_found:
-            player.gold += total_value
-            return jsonify({"success": True, "message": f"🔬 Сдано трофеев:\n{chr(10).join(trophies_found)}\n💰 Получено: {total_value} золота!", "player": player.to_dict()})
-        return jsonify({"error": "У вас нет трофеев для сдачи!"})
-    
-    if action == "study_artifacts":
-        has_artifact = any(item in player.inventory for item in ["Фрагмент брони Титана", "Часть пара Колосса", "Чешуя дракона", "Редкий артефакт"])
-        if has_artifact and random.random() < 0.4:
-            bonus = random.choice(["Зелье мудрости", "Эссенция титана", "Улучшенное лезвие"])
-            player.inventory.append(bonus)
-            return jsonify({"success": True, "message": f"🔬 Изучение успешно! Получен бонус: {bonus}", "player": player.to_dict()})
-        elif has_artifact:
-            return jsonify({"success": True, "message": "🔬 Изучение не дало результатов.", "player": player.to_dict()})
-        return jsonify({"error": "У вас нет артефактов для изучения!"})
-    
-    # ============ КОРОЛЕВСКИЙ ДВОРЕЦ ============
-    if action == "get_titan_reward":
-        total_kills = sum(player.titan_kills.values())
-        if total_kills >= 10:
-            reward = (total_kills // 10) * 50
-            player.gold += reward
-            return jsonify({"success": True, "message": f"👑 Королевская награда! За {total_kills} убитых титанов вы получаете {reward} золота!", "player": player.to_dict()})
-        return jsonify({"error": f"Убито титанов: {total_kills}/10. Вернитесь после 10 убийств."})
-    
-    if action == "get_title":
-        total_kills = sum(player.titan_kills.values())
-        if total_kills >= 50:
-            player.attack += 5
-            player.defense += 5
-            return jsonify({"success": True, "message": "👑 Вы получили титул 'Лорд Охотник'! Атака +5, Защита +5", "player": player.to_dict()})
-        elif total_kills >= 25:
-            player.attack += 3
-            return jsonify({"success": True, "message": "👑 Вы получили титул 'Мастер Охотник'! Атака +3", "player": player.to_dict()})
-        return jsonify({"error": f"Для получения титула нужно убить 25+ титанов. У вас: {total_kills}"})
-    
-    # ============ РЫНОК СИНЫ ============
-    if action == "sell_herbs":
-        herb_count = player.inventory.count("Лечебные травы")
-        if herb_count > 0:
-            total = herb_count * 5
-            for _ in range(herb_count):
-                player.inventory.remove("Лечебные травы")
-            player.gold += total
-            return jsonify({"success": True, "message": f"💰 Продано трав: {herb_count} шт. Получено: {total} золота!", "player": player.to_dict()})
-        return jsonify({"error": "У вас нет лечебных трав для продажи!"})
-    
-    if action == "sell_trophies":
-        sellable_items = {"Редкий артефакт": 40, "Драгоценный камень": 25, "Карта сокровищ": 70}
-        total_value = 0
-        sold = []
-        for item, price in sellable_items.items():
-            count = player.inventory.count(item)
-            if count > 0:
-                sold.append(f"{item} x{count}")
-                for _ in range(count):
-                    player.inventory.remove(item)
-                total_value += price * count
-        if sold:
-            player.gold += total_value
-            return jsonify({"success": True, "message": f"💰 Продано:\n{chr(10).join(sold)}\n💰 Получено: {total_value} золота!", "player": player.to_dict()})
-        return jsonify({"error": "У вас нет трофеев для продажи!"})
-    
-    if action == "buy_rare_components":
-        return jsonify({"success": True, "message": "⚗️ РЕДКИЕ КОМПОНЕНТЫ\n\n• Эссенция титана (80g) - Атака +3\n• Кристалл маны (120g) - Энергия +20\n• Порошок феникса (150g) - Здоровье +50", "player": player.to_dict()})
-    
-    if action == "Купить Эссенцию титана" and player.gold >= 80:
-        player.gold -= 80
-        player.attack += 3
-        return jsonify({"success": True, "message": "⚗️ Эссенция титана использована! Атака +3", "player": player.to_dict()})
-    
-    if action == "Купить Кристалл маны" and player.gold >= 120:
-        player.gold -= 120
-        player.max_energy += 20
-        player.energy = player.max_energy
-        return jsonify({"success": True, "message": "⚗️ Кристалл маны использован! Макс. энергия +20", "player": player.to_dict()})
-    
-    if action == "Купить Порошок феникса" and player.gold >= 150:
-        player.gold -= 150
-        player.health = min(player.max_health, player.health + 50)
-        return jsonify({"success": True, "message": "⚗️ Порошок феникса использован! Здоровье +50", "player": player.to_dict()})
-    
-    # ============ ХРАМ ВОИНОВ ============
-    if action == "get_blessing" and player.gold >= 50:
-        player.gold -= 50
-        player.attack += random.randint(1, 3)
-        player.defense += random.randint(1, 3)
-        player.agility += random.randint(1, 3)
-        return jsonify({"success": True, "message": "🙏 Благословение получено! Атака, защита и ловкость увеличены!", "player": player.to_dict()})
-    
-    if action == "meditate":
-        if player.can_rest():
-            player.energy = min(player.max_energy, player.energy + 30)
-            player.health = min(player.max_health, player.health + 20)
-            return jsonify({"success": True, "message": "🧘 Медитация восстановила силы! Энергия +30, Здоровье +20", "player": player.to_dict()})
-        return jsonify({"error": "Вы уже медитировали недавно!"})
-    
-    if action == "donate" and player.gold >= 100:
-        player.gold -= 100
-        player.max_health += 10
-        player.health = player.max_health
-        return jsonify({"success": True, "message": "💰 Пожертвование принято! Макс. здоровье +10", "player": player.to_dict()})
-    
-    # ============ ЗАДАНИЯ ============
-    if action == "Взять задание":
-        available_quests = {
-            "Аномальный титан": {"цель": 3, "награда": 100},
-            "Звероподобный титан": {"цель": 2, "награда": 150}
-        }
-        for quest_name, quest in available_quests.items():
-            if quest_name not in player.quests:
-                player.quests[quest_name] = {"цель": quest["цель"], "прогресс": 0, "награда": quest["награда"]}
-                return jsonify({"success": True, "message": f"📜 Получено новое задание: {quest_name}. Цель: убить {quest['цель']}. Награда: {quest['награда']} золота!", "player": player.to_dict()})
-        return jsonify({"error": "Нет доступных заданий!"})
-    
-    # ============ ИССЛЕДОВАНИЕ ЛЕСА ============
+    # Исследование
     if action == "explore":
-        events = [
-            {"text": "🌿 Нашли травы!", "item": "Лечебные травы"},
-            {"text": "💰 Нашли 15 золота!", "gold": 15},
-            {"text": "⚡ Восстановили энергию!", "energy": 20}
-        ]
+        events = [{"text": "🌿 Нашли травы!", "item": "Лечебные травы"}, {"text": "💰 Нашли 15 золота!", "gold": 15}]
         event = random.choice(events)
-        if event.get("item"):
-            player.inventory.append(event["item"])
-        if event.get("gold"):
-            player.gold += event["gold"]
-        if event.get("energy"):
-            player.energy = min(player.max_energy, player.energy + event["energy"])
+        if event.get("item"): player.inventory.append(event["item"])
+        if event.get("gold"): player.gold += event["gold"]
         return jsonify({"success": True, "message": event["text"], "player": player.to_dict()})
     
-    # ============ ОХОТА НА ТИТАНОВ ============
-    if action == "hunt":
-        if not player.odm_gear:
-            return jsonify({"error": "Нужно ODM снаряжение!"})
-        
-        titan_names = ["Обычный титан", "Аномальный титан", "Звероподобный титан"]
-        weights = [0.6, 0.3, 0.1]
-        titan_name = random.choices(titan_names, weights=weights)[0]
+    # Охота
+    if action == "hunt" and player.odm_gear:
+        titan_name = random.choice(["Обычный титан", "Аномальный титан", "Звероподобный титан"])
         titan = TITANS[titan_name]
-        
         battle_id = str(random.randint(10000, 99999)) + str(int(datetime.now().timestamp()))
-        battles[battle_id] = {
-            "player_id": session_id,
-            "enemy_name": titan_name,
-            "enemy_health": titan["здоровье"],
-            "enemy_max_health": titan["здоровье"],
-            "enemy_attack": titan["атака"],
-            "reward": titan["награда"],
-            "weak_spot": titan["слабое_место"],
-            "description": titan["описание"],
-            "is_boss": False
-        }
-        
-        return jsonify({
-            "battle_start": True,
-            "battle_id": battle_id,
-            "enemy": titan_name,
-            "enemy_health": titan["здоровье"],
-            "enemy_max_health": titan["здоровье"],
-            "weak_spot": titan["слабое_место"],
-            "description": titan["описание"],
-            "player_health": player.health
-        })
+        battles[battle_id] = {"player_id": session_id, "enemy_name": titan_name, "enemy_health": titan["здоровье"], "enemy_max_health": titan["здоровье"], "enemy_attack": titan["атака"], "reward": titan["награда"], "weak_spot": titan["слабое_место"], "description": titan["описание"]}
+        return jsonify({"battle_start": True, "battle_id": battle_id, "enemy": titan_name, "enemy_health": titan["здоровье"], "enemy_max_health": titan["здоровье"], "weak_spot": titan["слабое_место"], "description": titan["описание"], "player_health": player.health})
     
-    # ============ БОССЫ ============
-    if action in ["Броня Титана", "Колоссальный титан", "Дракон"]:
-        if not player.odm_gear:
-            return jsonify({"error": "Нужно ODM снаряжение!"})
-        
-        level_req = {"Броня Титана": 10, "Колоссальный титан": 20, "Дракон": 30}
-        if player.level < level_req[action]:
-            return jsonify({"error": f"Нужен {level_req[action]}+ уровень!"})
-        
+    # Боссы
+    if action in ["Броня Титана", "Колоссальный титан", "Дракон"] and player.odm_gear:
         titan = TITANS[action]
         battle_id = str(random.randint(10000, 99999)) + str(int(datetime.now().timestamp()))
-        battles[battle_id] = {
-            "player_id": session_id,
-            "enemy_name": action,
-            "enemy_health": titan["здоровье"],
-            "enemy_max_health": titan["здоровье"],
-            "enemy_attack": titan["атака"],
-            "reward": titan["награда"],
-            "weak_spot": titan["слабое_место"],
-            "description": titan["описание"],
-            "is_boss": True
-        }
-        
-        return jsonify({
-            "battle_start": True,
-            "battle_id": battle_id,
-            "enemy": action,
-            "enemy_health": titan["здоровье"],
-            "enemy_max_health": titan["здоровье"],
-            "weak_spot": titan["слабое_место"],
-            "description": titan["описание"],
-            "is_boss": True,
-            "player_health": player.health
-        })
+        battles[battle_id] = {"player_id": session_id, "enemy_name": action, "enemy_health": titan["здоровье"], "enemy_max_health": titan["здоровье"], "enemy_attack": titan["атака"], "reward": titan["награда"], "weak_spot": titan["слабое_место"], "description": titan["описание"], "is_boss": True}
+        return jsonify({"battle_start": True, "battle_id": battle_id, "enemy": action, "enemy_health": titan["здоровье"], "enemy_max_health": titan["здоровье"], "weak_spot": titan["слабое_место"], "description": titan["описание"], "is_boss": True, "player_health": player.health})
     
-    # ============ БОЕВЫЕ ДЕЙСТВИЯ ============
-    if action == "battle_attack":
-        if not battle_id or battle_id not in battles:
-            return jsonify({"error": "Битва не найдена"})
-        
+    # Боевые действия
+    if action == "battle_attack" and battle_id in battles:
         battle = battles[battle_id]
         player = players[battle["player_id"]]
-        
         damage = random.randint(10, 25) + player.attack // 2
         battle["enemy_health"] -= damage
-        
         if battle["enemy_health"] <= 0:
             gold_gain = random.randint(battle["reward"][0], battle["reward"][1])
-            exp_gain = random.randint(15, 30)
             player.gold += gold_gain
-            player.exp += exp_gain
-            player.titan_kills[battle["enemy_name"]] = player.titan_kills.get(battle["enemy_name"], 0) + 1
-            
-            level_msg = ""
-            if player.exp >= player.max_exp:
-                player.level += 1
-                player.exp -= player.max_exp
-                player.max_exp = int(player.max_exp * 1.5)
-                level_msg = f"\n⭐ НОВЫЙ УРОВЕНЬ {player.level}!"
-            
             del battles[battle_id]
-            return jsonify({
-                "victory": True,
-                "message": f"ПОБЕДА! +{gold_gain} золота, +{exp_gain} опыта{level_msg}",
-                "player": player.to_dict()
-            })
-        
-        enemy_damage = max(1, battle["enemy_attack"] - player.defense // 3 + random.randint(-5, 10))
+            return jsonify({"victory": True, "message": f"ПОБЕДА! +{gold_gain} золота", "player": player.to_dict()})
+        enemy_damage = max(1, battle["enemy_attack"] - player.defense // 3)
         player.health -= enemy_damage
-        
         if player.health <= 0:
             player.health = player.max_health // 2
-            player.gold = max(0, player.gold - 20)
             del battles[battle_id]
-            return jsonify({
-                "defeat": True,
-                "message": "ВЫ ПОГИБЛИ!",
-                "player": player.to_dict()
-            })
-        
-        return jsonify({
-            "action": "attack",
-            "damage": damage,
-            "enemy_damage": enemy_damage,
-            "enemy_health": battle["enemy_health"],
-            "enemy_max_health": battle["enemy_max_health"],
-            "player_health": player.health,
-            "message": f"Вы нанесли {damage} урона! {battle['enemy_name']} атакует! -{enemy_damage} HP",
-            "player": player.to_dict()
-        })
+            return jsonify({"defeat": True, "message": "ВЫ ПОГИБЛИ!", "player": player.to_dict()})
+        return jsonify({"action": "attack", "damage": damage, "enemy_damage": enemy_damage, "enemy_health": battle["enemy_health"], "player_health": player.health, "message": f"Урон {damage}! Враг атакует -{enemy_damage}", "player": player.to_dict()})
     
-    if action == "battle_heal":
-        if not battle_id or battle_id not in battles:
-            return jsonify({"error": "Битва не найдена"})
-        
+    if action == "battle_heal" and battle_id in battles:
         battle = battles[battle_id]
         player = players[battle["player_id"]]
-        
-        zelie_index = -1
-        for i, item in enumerate(player.inventory):
-            if item in ["Зелье здоровья", "Большое зелье"]:
-                zelie_index = i
-                break
-        
-        if zelie_index == -1:
-            return jsonify({"error": "Нет зелий!"})
-        
-        zelie = player.inventory[zelie_index]
-        heal = 60 if zelie == "Большое зелье" else 30
-        player.health = min(player.max_health, player.health + heal)
-        player.inventory.pop(zelie_index)
-        
-        enemy_damage = max(1, battle["enemy_attack"] - player.defense // 3 + random.randint(-5, 10))
-        player.health -= enemy_damage
-        
-        if player.health <= 0:
-            player.health = player.max_health // 2
-            player.gold = max(0, player.gold - 20)
-            del battles[battle_id]
-            return jsonify({
-                "defeat": True,
-                "message": "ВЫ ПОГИБЛИ!",
-                "player": player.to_dict()
-            })
-        
-        return jsonify({
-            "action": "heal",
-            "heal": heal,
-            "enemy_damage": enemy_damage,
-            "player_health": player.health,
-            "enemy_health": battle["enemy_health"],
-            "enemy_max_health": battle["enemy_max_health"],
-            "message": f"Вылечили {heal} HP! {battle['enemy_name']} атакует! -{enemy_damage} HP",
-            "player": player.to_dict()
-        })
+        if "Зелье здоровья" in player.inventory:
+            player.inventory.remove("Зелье здоровья")
+            player.health = min(player.max_health, player.health + 30)
+            return jsonify({"action": "heal", "heal": 30, "player_health": player.health, "message": "Вылечили 30 HP!", "player": player.to_dict()})
+        return jsonify({"error": "Нет зелий!"})
     
-    if action == "battle_flee":
-        if not battle_id or battle_id not in battles:
-            return jsonify({"error": "Битва не найдена"})
-        
-        battle = battles[battle_id]
-        player = players[battle["player_id"]]
-        
-        if random.random() < 0.5:
-            del battles[battle_id]
-            return jsonify({
-                "fled": True,
-                "message": "Вы сбежали!",
-                "player": player.to_dict()
-            })
-        else:
-            enemy_damage = max(1, battle["enemy_attack"] + random.randint(5, 15))
-            player.health -= enemy_damage
-            
-            if player.health <= 0:
-                player.health = player.max_health // 2
-                player.gold = max(0, player.gold - 20)
-                del battles[battle_id]
-                return jsonify({
-                    "defeat": True,
-                    "message": "ВЫ ПОГИБЛИ при побеге!",
-                    "player": player.to_dict()
-                })
-            
-            return jsonify({
-                "action": "flee_fail",
-                "enemy_damage": enemy_damage,
-                "player_health": player.health,
-                "message": f"Не сбежали! -{enemy_damage} HP",
-                "player": player.to_dict()
-            })
-    
-    # ============ МИКАСА ============
-    if action == "talk_mikasa":
-        gain = random.randint(1, 3)
-        player.mikasa_relationship = min(100, player.mikasa_relationship + gain)
-        
-        if player.mikasa_relationship >= 20 and player.mikasa_level < 1:
-            player.mikasa_level = 1
-        elif player.mikasa_relationship >= 40 and player.mikasa_level < 2:
-            player.mikasa_level = 2
-        elif player.mikasa_relationship >= 60 and player.mikasa_level < 3:
-            player.mikasa_level = 3
-        elif player.mikasa_relationship >= 80 and player.mikasa_level < 4:
-            player.mikasa_level = 4
-        elif player.mikasa_relationship >= 100 and player.mikasa_level < 5:
-            player.mikasa_level = 5
-        
-        return jsonify({"success": True, "message": f"Отношения +{gain} ({player.mikasa_relationship}/100)", "player": player.to_dict()})
-    
-    if action == "mikasa_status":
-        return jsonify({
-            "mikasa_status": True,
-            "relationship": player.mikasa_relationship,
-            "level": player.mikasa_level,
-            "has_companion": player.has_companion
-        })
-    
-    if action in ["invite_mikasa", "summon_mikasa"]:
-        if player.mikasa_level < 1:
-            return jsonify({"error": "Улучшите отношения!"})
-        if player.has_companion:
-            return jsonify({"error": "Микаса уже в команде!"})
-        
-        player.has_companion = True
-        player.companion_name = "Микаса Аккерман"
-        return jsonify({"success": True, "message": "Микаса присоединилась!", "player": player.to_dict()})
-    
-    if action == "train_with_mikasa":
-        if not player.odm_gear:
-            return jsonify({"error": "Нужно ODM снаряжение!"})
-        if player.gas_level < 30 or player.blades_count < 4:
-            return jsonify({"error": "Недостаточно газа или лезвий!"})
-        
-        player.gas_level -= 30
-        player.blades_count -= 4
-        player.energy -= 40
-        exp_gain = random.randint(50, 80)
-        agility_gain = random.randint(2, 5)
-        player.exp += exp_gain
-        player.agility += agility_gain
-        relationship_gain = random.randint(3, 6)
-        player.mikasa_relationship = min(100, player.mikasa_relationship + relationship_gain)
-        
-        level_msg = ""
-        if player.exp >= player.max_exp:
-            player.level += 1
-            player.exp -= player.max_exp
-            player.max_exp = int(player.max_exp * 1.5)
-            level_msg = f"\n⭐ НОВЫЙ УРОВЕНЬ {player.level}!"
-        
-        return jsonify({"success": True, "message": f"Тренировка с Микасой! +{exp_gain} опыта, ловкость +{agility_gain}, отношения +{relationship_gain}{level_msg}", "player": player.to_dict()})
-    
-    if action == "give_gift":
-        gifts = ["Красный шарф", "Шоколад", "Книга", "Цветы", "Чай"]
-        gift_values = {"Красный шарф": 30, "Шоколад": 15, "Книга": 20, "Цветы": 25, "Чай": 10}
-        
-        for gift in gifts:
-            if gift in player.inventory:
-                player.inventory.remove(gift)
-                player.mikasa_relationship = min(100, player.mikasa_relationship + gift_values[gift])
-                return jsonify({"success": True, "message": f"Вы подарили {gift}! Отношения +{gift_values[gift]}", "player": player.to_dict()})
-        
-        return jsonify({"error": "Нет подарков!"})
-    
-    # ============ ЕСЛИ НИЧЕГО НЕ ПОДОШЛО ============
     return jsonify({"error": f"Неизвестное действие: {action}"})
 
-# Для Render.com
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
 else:
